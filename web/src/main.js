@@ -69,7 +69,9 @@ function renderHeader() {
   return h('header', {},
     h('h1', {}, '轨道载荷 A/B 双槽镜像升级 — 断电安全验收台'),
     h('p', {}, '任意断电均不会引导摘要不符或未确认的候选；新版本生效后不可回退。'
-      + '服务持久化槽位清单、候选阶段与确认代次，上电时仅从清单完整且已确认的槽位裁决唯一活动槽位。'),
+      + '镜像字节按设备隔离（同名 A/B 槽位互不共享）；上电时仅从【属于本设备、清单完整、'
+      + '实测摘要与清单一致且已确认】的槽位裁决唯一活动槽位，内容不符的镜像即使保留 '
+      + 'CONFIRMED 状态也会被拒绝引导并保留可复核证据。'),
   );
 }
 
@@ -112,7 +114,8 @@ function statusBadge(slot) {
 }
 
 function renderSlot(slot) {
-  const active = slot.name === state.device.active_slot;
+  const active = slot.name === bootedSlotName(state.device);
+  const mismatch = slot.digest && slot.actual_digest && slot.digest !== slot.actual_digest;
   return h('div', { class: `slot ${active ? 'active' : ''}` },
     h('h4', {}, `槽位 ${slot.name}`,
       active ? h('span', { class: 'active-tag' }, '● 活动槽位（正在引导）') : statusBadge(slot)),
@@ -120,17 +123,29 @@ function renderSlot(slot) {
       h('div', {}, h('b', {}, '状态'), slot.status),
       h('div', {}, h('b', {}, '版本'), slot.version ?? '—'),
       h('div', {}, h('b', {}, '清单摘要'), h('span', { class: 'mono' }, slot.digest ?? '—')),
-      h('div', {}, h('b', {}, '实测摘要'), h('span', { class: 'mono' }, slot.actual_digest ?? '—')),
+      h('div', {}, h('b', {}, '实测摘要'),
+        h('span', { class: `mono${mismatch ? ' bad' : ''}` }, slot.actual_digest ?? '—')),
+      h('div', {}, h('b', {}, '摘要一致'), String(slot.digest_matches)),
       h('div', {}, h('b', {}, '写入进度'), slot.size == null ? '出厂预置' : `${slot.written}/${slot.size} 字节`),
       h('div', {}, h('b', {}, '确认代次'), slot.confirmed_generation ?? '—'),
       h('div', {}, h('b', {}, '清单完整'), String(slot.manifest_complete)),
       h('div', {}, h('b', {}, '可引导'), String(slot.bootable)),
     ),
+    mismatch ? h('div', { class: 'mismatch-warning' },
+      '⚠ 实测摘要与清单摘要不符：镜像内容不属于本设备清单或已损坏。'
+      + '即使状态仍为 CONFIRMED，恢复裁决也会拒绝引导该槽位。') : null,
   );
+}
+
+// The slot the latest recovery adjudication actually booted (null = refused).
+function bootedSlotName(device) {
+  if (device.last_recovery && !device.last_recovery.active_slot) return null;
+  return device.active_slot;
 }
 
 function renderDevice() {
   const d = state.device;
+  const booted = bootedSlotName(d);
   const powerBtn = d.powered_on
     ? h('button', {
       class: 'danger',
@@ -142,8 +157,8 @@ function renderDevice() {
     h('div', { class: 'meta' },
       h('span', {}, h('b', {}, '电源：'),
         h('span', { class: d.powered_on ? 'power-on' : 'power-off' }, d.powered_on ? '通电运行' : '已断电')),
-      h('span', {}, h('b', {}, '活动槽位：'), d.active_slot),
-      h('span', {}, h('b', {}, '活动版本：'), d.slots[d.active_slot]?.version ?? '不可引导'),
+      h('span', {}, h('b', {}, '活动槽位：'), booted ?? '无（拒绝引导）'),
+      h('span', {}, h('b', {}, '活动版本：'), booted ? d.slots[booted]?.version ?? '—' : '不可引导'),
       h('span', {}, h('b', {}, '确认代次：'), String(d.generation)),
       h('span', {}, h('b', {}, '升级资格：'),
         d.qualified_request ? `已由 ${d.qualified_request} 于代次 ${d.qualified_generation} 取得（槽 ${d.qualified_slot}）` : '空闲'),

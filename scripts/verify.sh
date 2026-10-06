@@ -2,8 +2,9 @@
 # One-shot acceptance gate:
 #   1. backend code tests (pytest)
 #   2. build the web page (vite)
-#   3. boot a real uvicorn server and smoke-test power-loss recovery and
-#      concurrent upgrade adjudication over HTTP
+#   3. boot a real uvicorn server and smoke-test power-loss recovery,
+#      concurrent upgrade adjudication, multi-device image isolation and
+#      safe convergence of legacy contaminated devices over HTTP
 # Exits non-zero if any stage fails.
 set -euo pipefail
 
@@ -31,7 +32,11 @@ npm run build
 test -f "$ROOT/web/dist/index.html"
 cd "$ROOT"
 
-echo "==> [3/4] start real HTTP server on :$SMOKE_PORT"
+echo "==> [3/4] seed legacy contaminated DB + start real HTTP server on :$SMOKE_PORT"
+# Pre-seed the server DB with the historical shared-blob schema (two devices
+# already affected by cross-device image clobbering). The server migrates it
+# on boot; the smoke then verifies safe convergence over HTTP.
+"$PY" scripts/make_legacy_db.py "$TMPDIR_RUN/upgrade.db"
 DATA_PATH="$TMPDIR_RUN/upgrade.db" "$PY" -m uvicorn backend.api:app \
   --host 127.0.0.1 --port "$SMOKE_PORT" --log-level warning &
 SERVER_PID=$!
@@ -47,7 +52,7 @@ for i in $(seq 1 50); do
   sleep 0.3
 done
 
-echo "==> [4/4] HTTP smoke: power-loss recovery + concurrent adjudication"
+echo "==> [4/4] HTTP smoke: recovery + concurrency + multi-device isolation + legacy convergence"
 "$PY" scripts/smoke_http.py "http://127.0.0.1:$SMOKE_PORT"
 
 echo "==> VERIFY PASSED"

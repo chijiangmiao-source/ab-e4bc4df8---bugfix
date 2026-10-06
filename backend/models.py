@@ -14,8 +14,9 @@ A slot manifest goes through these stages:
                     it is retained but can never be selected again (no rollback)
 
 Power loss can interrupt any step. Recovery never trusts an in-flight write or
-an unverified/unconfirmed candidate: it selects the *unique* slot whose
-manifest is complete AND whose status is CONFIRMED.
+an unverified/unconfirmed candidate: it selects the *unique* slot whose image
+belongs to this device, whose manifest is complete, whose re-measured digest
+matches the manifest digest AND whose status is CONFIRMED.
 """
 from __future__ import annotations
 
@@ -59,9 +60,10 @@ class Slot:
     def manifest_complete(self) -> bool:
         """True iff the write finished and a manifest digest is present.
 
-        Note: completeness alone is not enough to boot -- CONFIRMED status is
-        also required. REJECTED/SUPERSEDED slots may carry complete manifests
-        but must never be selected.
+        Note: completeness alone is not enough to boot -- CONFIRMED status and
+        a measured digest matching the manifest are also required.
+        REJECTED/SUPERSEDED slots may carry complete manifests but must never
+        be selected.
         """
         if self.status in (SlotStatus.EMPTY, SlotStatus.CANDIDATE):
             return False
@@ -70,6 +72,11 @@ class Slot:
         if self.size is None:
             return True  # factory slot provisioned directly from a manifest
         return self.written == self.size
+
+    def digest_matches(self) -> bool:
+        """True iff the measured digest proves the on-flash image is the one
+        this device's manifest claims (content belongs to *this* device)."""
+        return bool(self.digest) and self.actual_digest == self.digest
 
     def to_dict(self) -> dict:
         return {
@@ -82,7 +89,10 @@ class Slot:
             "written": self.written,
             "confirmed_generation": self.confirmed_generation,
             "manifest_complete": self.manifest_complete(),
-            "bootable": self.status.bootable and self.manifest_complete(),
+            "digest_matches": self.digest_matches(),
+            "bootable": self.status.bootable
+            and self.manifest_complete()
+            and self.digest_matches(),
         }
 
     @classmethod

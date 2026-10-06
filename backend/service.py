@@ -8,10 +8,14 @@ The service enforces three safety rules:
 2. **Generation qualification** -- at any generation exactly one submitting
    request may stage a candidate. Competing submissions get a stable ``409``
    and touch nothing (SQLite ``BEGIN IMMEDIATE`` serialises the decision).
-3. **Unique-confirmed-slot boot** -- recovery selects the unique slot with a
-   complete manifest that is ``CONFIRMED``. Unconfirmed / corrupt candidates
-   are diagnosed but never booted, and a ``SUPERSEDED`` slot can never return,
-   so a new effective version can never roll back.
+3. **Unique-confirmed-slot boot** -- recovery selects the unique slot whose
+   image belongs to this device (per-device blob), whose manifest is complete,
+   whose re-measured digest matches the manifest digest AND whose status is
+   ``CONFIRMED``. A retained ``CONFIRMED`` flag never rescues content that
+   fails re-measurement: the mismatch is kept as reviewable evidence and the
+   image is refused. Unconfirmed candidates are diagnosed but never booted,
+   and a ``SUPERSEDED`` slot can never return, so a new effective version can
+   never roll back.
 """
 from __future__ import annotations
 
@@ -239,7 +243,7 @@ class UpgradeService:
             )
 
         with self.store.transaction() as conn:
-            content = self.store.read_blob(conn, target_name)
+            content = self.store.read_blob(conn, device_id, target_name)
             actual = sha256_hex(content or b"")
             dev = self.store.load(device_id)
             t = dev.slots[target_name]
@@ -305,7 +309,7 @@ class UpgradeService:
                     "不存在已验证待确认的候选",
                 )
             # Re-measure immediately before commit: never confirm on trust.
-            content = self.store.read_blob(conn, target_name)
+            content = self.store.read_blob(conn, device_id, target_name)
             actual = sha256_hex(content) if content is not None else None
             if actual != target.digest or target.digest is None:
                 target.status = SlotStatus.REJECTED
@@ -411,21 +415,44 @@ class UpgradeService:
 
     # ------------------------------------------------------------------ #
     def _refresh_confirmed_measurements(self, conn, dev: Device) -> None:
+        """Re-measure every CONFIRMED slot against *this device's own* blob.
+
+        A retained CONFIRMED flag is never trusted on its own: if the
+        re-measured digest no longer matches the manifest digest, the slot is
+        excluded from boot by the adjudicator and the mismatch is preserved as
+        reviewable, append-only evidence (recorded once per distinct measured
+        value, so repeated re-opens stay convergent and auditable).
+        """
         for slot in dev.slots.values():
             if slot.status is not SlotStatus.CONFIRMED:
                 continue
-            content = self.store.read_blob(conn, slot.name)
+            content = self.store.read_blob(conn, dev.device_id, slot.name)
             measured = sha256_hex(content) if content is not None else None
-            if measured == slot.actual_digest:
-                continue
-            prior = slot.actual_digest
-            slot.actual_digest = measured
-            dev.add_evidence(
-                slot.name,
-                "recovery_measurement_changed",
-                f"恢复时重新测得摘要 {measured or '缺失'}；"
-                f"上次持久化实测值为 {prior or '缺失'}",
-            )
+            if measured != slot.actual_digest:
+                prior = slot.actual_digest
+                slot.actual_digest = measured
+                dev.add_evidence(
+                    slot.name,
+                    "recovery_measurement_changed",
+                    f"恢复时重新测得摘要 {measured or '缺失'}；"
+                    f"上次持久化实测值为 {prior or '缺失'}",
+                )
+            if measured != slot.digest:
+                marker = measured or "缺失"
+                already = any(
+                    e["reason"] == "digest_mismatch"
+                    and e["slot"] == slot.name
+                    and marker in e["detail"]
+                    for e in dev.evidence
+                )
+                if not already:
+                    dev.add_evidence(
+                        slot.name,
+                        "digest_mismatch",
+                        f"已确认槽位实测摘要与清单不符：清单 {slot.digest}，"
+                        f"实测 {marker}；镜像不属于本设备清单或已损坏，"
+                        "禁止引导该槽位",
+                    )
 
     def _adjudicate(self, dev: Device) -> RecoveryReport:
         """Pick the unique bootable slot; explain every other slot's fate."""
@@ -444,7 +471,8 @@ class UpgradeService:
                 report.diagnoses.append(Diagnosis(name, reason, detail))
 
         report.rationale.append(
-            "恢复规则：仅从【清单完整 且 状态为 CONFIRMED】的槽位中选定唯一活动槽位"
+            "恢复规则：仅从【镜像属于本设备、清单完整、实测摘要与清单一致 "
+            "且状态为 CONFIRMED】的槽位中选定唯一活动槽位"
         )
         report.rationale.append(f"当前确认代次：{dev.generation}")
 
@@ -470,8 +498,9 @@ class UpgradeService:
                 )
         elif len(eligible) == 0:
             report.critical = (
-                "不存在任何清单完整且已确认的槽位，设备无法引导；"
-                "所有未确认/损坏候选均保留为诊断证据且未被选择"
+                "不存在任何同时满足【属于本设备、清单完整、实测摘要与清单一致、"
+                "已确认】的槽位，设备无法引导；所有未确认/内容不符的候选均保留"
+                "为诊断证据且未被选择，已被取代（SUPERSEDED）的槽位不会回退启用"
             )
             report.rationale.append("裁决：零合格槽位，保持关机/维修状态")
         else:
@@ -484,8 +513,26 @@ class UpgradeService:
 
     @staticmethod
     def _slot_verdict(slot: Slot) -> tuple[bool, str, str]:
-        if slot.status is SlotStatus.CONFIRMED and slot.manifest_complete():
-            return True, "eligible", "清单完整且已确认，具备引导资格"
+        if slot.status is SlotStatus.CONFIRMED:
+            if not slot.manifest_complete():
+                return (
+                    False,
+                    "incomplete_manifest",
+                    "已确认槽位清单不完整（摘要缺失或写入字节不足），禁止引导",
+                )
+            if not slot.digest_matches():
+                return (
+                    False,
+                    "digest_mismatch",
+                    f"已确认槽位实测摘要与清单摘要不符（清单 {slot.digest}，"
+                    f"实测 {slot.actual_digest or '缺失'}）：镜像内容不属于本设备"
+                    "清单或已损坏；CONFIRMED 状态不能赦免内容不符的镜像，禁止引导",
+                )
+            return (
+                True,
+                "eligible",
+                "镜像属于本设备、清单完整、实测摘要与清单一致且已确认，具备引导资格",
+            )
         if slot.status is SlotStatus.EMPTY:
             return False, "empty_slot", "空槽位，无镜像清单"
         if slot.status is SlotStatus.CANDIDATE:

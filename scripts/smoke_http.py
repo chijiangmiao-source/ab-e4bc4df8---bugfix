@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""HTTP smoke test for power-loss recovery and concurrent adjudication.
+"""HTTP smoke test for power-loss recovery, concurrent adjudication and
+multi-device image ownership.
 
 Talks to a *live* uvicorn server (plain stdlib only) and exits non-zero on the
-first failed expectation.
+first failed expectation. If the server DB was seeded with
+``scripts/make_legacy_db.py``, the already-affected legacy devices are also
+checked for safe convergence.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sys
 import threading
@@ -48,6 +53,19 @@ def power_cycle(dev, expected_slot, expected_gen):
                 f"{dev}: recovery selected {rec['active_slot']}, want {expected_slot}")
     assert_that(rec["generation"] == expected_gen,
                 f"{dev}: generation {rec['generation']}, want {expected_gen}")
+    return rec, d
+
+
+def power_cycle_refusal(dev):
+    """Power-cycle a device that must *refuse* to boot its persisted image."""
+    call("POST", f"/api/devices/{dev}/power-off", {}, 200)
+    _, body = call("POST", f"/api/devices/{dev}/power-on", {}, 200)
+    rec, d = body["recovery"], body["device"]
+    assert_that(body["outcome"] == "unbootable",
+                f"{dev}: expected unbootable, got {body['outcome']}")
+    assert_that(rec["active_slot"] is None,
+                f"{dev}: recovery must refuse the mismatched image")
+    assert_that(bool(rec["critical"]), f"{dev}: critical rationale missing")
     return rec, d
 
 
@@ -142,8 +160,135 @@ def main() -> int:
                     f"field {field} changed across reopen")
     assert_that(after["generation"] == before["generation"], "generation changed across reopen")
 
+    # --- multi-device isolation: same A/B slot names, different images ------
+    m1_img = b"m1-image::1.0.0::" + bytes((i * 3 + 5) & 0xFF for i in range(200))
+    m2_img = b"m2-image::1.0.0::" + bytes((i * 7 + 9) & 0xFF for i in range(200))
+    m2_img2 = b"m2-image::2.0.0::" + bytes((i * 11 + 13) & 0xFF for i in range(220))
+    m1_digest = hashlib.sha256(m1_img).hexdigest()
+    m2_digest = hashlib.sha256(m2_img).hexdigest()
+    m2_digest2 = hashlib.sha256(m2_img2).hexdigest()
+    assert_that(len({m1_digest, m2_digest, m2_digest2}) == 3,
+                "test images must have distinct digests")
+
+    call("POST", "/api/devices",
+         {"device_id": "m1", "version": "1.0.0",
+          "content_b64": base64.b64encode(m1_img).decode()}, 201)
+    call("POST", "/api/devices",
+         {"device_id": "m2", "version": "1.0.0",
+          "content_b64": base64.b64encode(m2_img).decode()}, 201)
+
+    # m2's creation must not rewrite m1's image, digest or measured digest.
+    _, d = call("GET", "/api/devices/m1", expect=200)
+    a = d["device"]["slots"]["A"]
+    assert_that(a["digest"] == a["actual_digest"] == m1_digest and a["bootable"],
+                "m1 slot A changed after m2 creation (cross-device clobber)")
+
+    # m1 power cycle: recovery re-measures m1's own bytes and boots A.
+    rec, d = power_cycle("m1", "A", 1)
+    a = d["slots"]["A"]
+    assert_that(a["digest"] == a["actual_digest"] == m1_digest,
+                "m1 digest/active-slot inconsistency after reopen")
+    snapshot = d
+
+    def m1_untouched():
+        _, cur = call("GET", "/api/devices/m1", expect=200)
+        assert_that(cur["device"] == snapshot,
+                    "m1 slots/version/candidate/evidence changed by peer activity")
+
+    # Peer power cut mid candidate-write, then recovery: m1 untouched.
+    _, b = call("POST", "/api/devices/m2/candidate",
+                {"version": "2.0.0", "request_id": "m2-cut",
+                 "content_b64": base64.b64encode(m2_img2).decode(),
+                 "fault_point": "candidate_write"}, 200)
+    assert_that(b["outcome"] == "power_cut", "m2 candidate_write fault not injected")
+    m1_untouched()
+    power_cycle("m2", "A", 1)
+    m1_untouched()
+
+    # Peer stages and commits a full upgrade: m1 untouched at every step.
+    _, b = call("POST", "/api/devices/m2/candidate",
+                {"version": "2.0.0", "request_id": "m2-up",
+                 "content_b64": base64.b64encode(m2_img2).decode()}, 200)
+    assert_that(b["outcome"] == "staged", "m2 candidate not staged")
+    m1_untouched()
+    _, b = call("POST", "/api/devices/m2/confirm", {}, 200)
+    assert_that(b["outcome"] == "switched" and b["active_slot"] == "B",
+                "m2 confirm switch failed")
+    m1_untouched()
+
+    # m1 recovers from a power cut: still its own image/version/generation,
+    # and its diagnostic evidence was never touched by m2's activity.
+    rec, d = power_cycle("m1", "A", 1)
+    a = d["slots"]["A"]
+    assert_that(a["version"] == "1.0.0" and a["status"] == "CONFIRMED",
+                "m1 confirmed version changed")
+    assert_that(a["digest"] == a["actual_digest"] == m1_digest,
+                "m1 digest mismatch after peer upgrade")
+    assert_that(d["slots"]["B"]["status"] == "EMPTY", "m1 candidate stage leaked")
+    assert_that(d["evidence"] == snapshot["evidence"], "m1 evidence changed by peer")
+
+    # m2 recovered onto its own upgraded slot with its own digest.
+    rec, d2 = power_cycle("m2", "B", 2)
+    slot_b = d2["slots"]["B"]
+    assert_that(slot_b["digest"] == slot_b["actual_digest"] == m2_digest2,
+                "m2 digest/active-slot inconsistency after reopen")
+
+    # --- legacy contaminated devices: safe convergence ----------------------
+    _, listing = call("GET", "/api/devices", expect=200)
+    legacy_ids = {x["device_id"] for x in listing["devices"]}
+    if "legacy-jia" in legacy_ids:
+        # Seeded by scripts/make_legacy_db.py: jia's confirmed slot-A manifest
+        # claims its own digest while the persisted image belongs to yi.
+        rec, d = power_cycle_refusal("legacy-jia")
+        diag = {x["slot"]: x["reason"] for x in rec["diagnoses"]}
+        assert_that(diag.get("A") == "digest_mismatch",
+                    f"legacy-jia: want digest_mismatch diagnosis, got {diag}")
+        a = d["slots"]["A"]
+        assert_that(a["status"] == "CONFIRMED" and not a["bootable"],
+                    "legacy-jia: CONFIRMED retained but must not be bootable")
+        assert_that(a["digest"] != a["actual_digest"],
+                    "legacy-jia: manifest vs measured digests must stay reviewable")
+        mism = [e for e in d["evidence"]
+                if e["reason"] == "digest_mismatch" and e["slot"] == "A"]
+        assert_that(len(mism) == 1 and a["digest"] in mism[0]["detail"]
+                    and a["actual_digest"] in mism[0]["detail"],
+                    "legacy-jia: reviewable digest_mismatch evidence missing")
+
+        # The healthy peer keeps booting its own image...
+        rec_yi, d_yi = power_cycle("legacy-yi", "A", 1)
+        ay = d_yi["slots"]["A"]
+        assert_that(ay["digest"] == ay["actual_digest"] and ay["bootable"],
+                    "legacy-yi: healthy slot damaged by peer recovery")
+
+        # ...and jia converges: same refusal, no duplicated evidence, and yi's
+        # slot is never overwritten by jia's recovery.
+        rec2, d2 = power_cycle_refusal("legacy-jia")
+        mism2 = [e for e in d2["evidence"] if e["reason"] == "digest_mismatch"]
+        assert_that(len(mism2) == 1, "legacy-jia: evidence not convergent")
+        rec_yi2, d_yi2 = power_cycle("legacy-yi", "A", 1)
+        assert_that(d_yi2["slots"]["A"] == ay, "legacy-yi: slot changed by peer recovery")
+
+        # jia2 already ran 2.0.0 on B (A SUPERSEDED) but B's image is foreign:
+        # refuse B, never roll back to the SUPERSEDED A.
+        rec, d = power_cycle_refusal("legacy-jia2")
+        diag = {x["slot"]: x["reason"] for x in rec["diagnoses"]}
+        assert_that(diag.get("A") == "superseded_no_rollback",
+                    f"legacy-jia2: rollback guard missing, got {diag}")
+        assert_that(diag.get("B") == "digest_mismatch",
+                    f"legacy-jia2: want digest_mismatch for B, got {diag}")
+        assert_that(d["slots"]["A"]["status"] == "SUPERSEDED",
+                    "legacy-jia2: superseded slot must stay superseded")
+        assert_that(any(e["reason"] == "digest_mismatch" and e["slot"] == "B"
+                        for e in d["evidence"]),
+                    "legacy-jia2: digest_mismatch evidence for B missing")
+        rec_y2, d_y2 = power_cycle("legacy-yi2", "B", 2)
+        by2 = d_y2["slots"]["B"]
+        assert_that(by2["digest"] == by2["actual_digest"] and by2["bootable"],
+                    "legacy-yi2: healthy upgraded slot damaged")
+
     print(f"SMOKE OK: {checks} HTTP assertions passed "
-          f"(power-loss x3, corrupt candidate, concurrent 409, reopen consistency)")
+          f"(power-loss x3, corrupt candidate, concurrent 409, reopen consistency, "
+          f"multi-device isolation, legacy safe-convergence)")
     return 0
 
 

@@ -8,12 +8,18 @@ power cut is reported:
 * the confirmation generation and the qualification token,
 * append-only diagnostic evidence.
 
+Image bytes are keyed by ``(device_id, slot)``: two orbital payloads may both
+use A/B slot names, yet a blob always belongs to exactly one device. A legacy
+schema keyed by ``slot`` alone (shared across devices) is migrated on open --
+see :meth:`Store._migrate_legacy_blobs`.
+
 Mutations run under ``BEGIN IMMEDIATE`` so concurrent candidate submissions are
 serialised by SQLite itself; the service layer then applies the generation
 qualification rule on the freshly read row.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -29,9 +35,10 @@ CREATE TABLE IF NOT EXISTS devices (
     powered_on  INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS blobs (
+    device_id TEXT NOT NULL,
     slot      TEXT NOT NULL,
     content   BLOB NOT NULL,
-    PRIMARY KEY (slot)
+    PRIMARY KEY (device_id, slot)
 );
 """
 
@@ -50,10 +57,73 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate_legacy_blobs()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # ------------------------------------------------------------------ #
+    def _migrate_legacy_blobs(self) -> None:
+        """Move legacy slot-keyed blobs (shared across devices!) to per-device rows.
+
+        Legacy rows carry no device attribution, so content is copied only to
+        devices whose slot manifest *vouches* for those exact bytes (claimed or
+        last-measured digest matches). Everything else is dropped rather than
+        guessed: an already-affected device then measures a missing/foreign
+        image at its next recovery, keeps reviewable digest-mismatch evidence
+        and safely refuses to boot it -- it never inherits another device's
+        image, and a healthy device's slot is never overwritten.
+        """
+        with self._lock:
+            cols = [
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(blobs)").fetchall()
+            ]
+            if "device_id" in cols:
+                return  # already per-device (fresh or previously migrated DB)
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("ALTER TABLE blobs RENAME TO blobs_legacy")
+                self._conn.execute(
+                    """
+                    CREATE TABLE blobs (
+                        device_id TEXT NOT NULL,
+                        slot      TEXT NOT NULL,
+                        content   BLOB NOT NULL,
+                        PRIMARY KEY (device_id, slot)
+                    )
+                    """
+                )
+                legacy_rows = self._conn.execute(
+                    "SELECT slot, content FROM blobs_legacy"
+                ).fetchall()
+                manifests = []
+                for d in self._conn.execute(
+                    "SELECT device_id, data FROM devices"
+                ).fetchall():
+                    slots = json.loads(d["data"]).get("slots", {})
+                    manifests.append((d["device_id"], slots))
+                for row in legacy_rows:
+                    digest = hashlib.sha256(row["content"]).hexdigest()
+                    for device_id, slots in manifests:
+                        slot = slots.get(row["slot"])
+                        if not slot:
+                            continue
+                        vouched = {slot.get("digest"), slot.get("actual_digest")}
+                        if digest in vouched:
+                            self._conn.execute(
+                                """
+                                INSERT OR REPLACE INTO blobs (device_id, slot, content)
+                                VALUES (?, ?, ?)
+                                """,
+                                (device_id, row["slot"], row["content"]),
+                            )
+                self._conn.execute("DROP TABLE blobs_legacy")
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     # ------------------------------------------------------------------ #
     def list_device_ids(self) -> list[str]:
@@ -137,15 +207,18 @@ class Store:
     ) -> None:
         conn.execute(
             """
-            INSERT INTO blobs (slot, content) VALUES (?, ?)
-            ON CONFLICT(slot) DO UPDATE SET content=excluded.content
+            INSERT INTO blobs (device_id, slot, content) VALUES (?, ?, ?)
+            ON CONFLICT(device_id, slot) DO UPDATE SET content=excluded.content
             """,
-            (slot, content),
+            (device_id, slot, content),
         )
 
-    def read_blob(self, conn: sqlite3.Connection, slot: str) -> bytes | None:
+    def read_blob(
+        self, conn: sqlite3.Connection, device_id: str, slot: str
+    ) -> bytes | None:
         row = conn.execute(
-            "SELECT content FROM blobs WHERE slot=?", (slot,)
+            "SELECT content FROM blobs WHERE device_id=? AND slot=?",
+            (device_id, slot),
         ).fetchone()
         return row["content"] if row else None
 
@@ -154,16 +227,16 @@ class Store:
     ) -> int:
         """Persist a streaming write; returns the new total byte count."""
         row = conn.execute(
-            "SELECT content FROM blobs WHERE slot=?",
-            (slot,),
+            "SELECT content FROM blobs WHERE device_id=? AND slot=?",
+            (device_id, slot),
         ).fetchone()
         content = (row["content"] if row else b"") + chunk
         conn.execute(
             """
-            INSERT INTO blobs (slot, content) VALUES (?, ?)
-            ON CONFLICT(slot) DO UPDATE SET content=excluded.content
+            INSERT INTO blobs (device_id, slot, content) VALUES (?, ?, ?)
+            ON CONFLICT(device_id, slot) DO UPDATE SET content=excluded.content
             """,
-            (slot, content),
+            (device_id, slot, content),
         )
         return len(content)
 
