@@ -3,24 +3,30 @@
 模拟轨道载荷维护员的启动镜像升级流程。核心安全保证：
 
 - **任意时点断电都不会引导摘要不符或未确认的候选**；
+- **镜像永远只属于创建/升级它的那一台物理设备**：两台设备即使都用 A/B 槽位命名，镜像字节、清单摘要与槽位存储均按 `(设备, 槽位)` 隔离，一台设备的候选写入或确认切换不会改动另一台设备的镜像、已确认版本、候选阶段或诊断证据；
 - **新版本生效后永不回退**（旧槽位标记 `SUPERSEDED`，恢复时永不选择）；
-- 恢复时**仅从「清单完整且已确认」的槽位中选定唯一活动槽位**，并展示逐槽诊断证据与裁决理由；
+- 恢复时**仅从「属于本设备、镜像完整、实测摘要与清单一致、且已确认」的槽位中选定唯一活动槽位**，并展示逐槽诊断证据与裁决理由；残留的 `CONFIRMED` 状态绝不单独采信；
+- 已被异设备/损坏字节污染的持久化槽位，重开时**保留可复核的摘要不一致证据并安全拒绝引导**，不回退到被取代版本，也不波及另一台仍正常的设备；
 - 两个页面并发提交不同候选时，**仅一个请求取得当前代次的升级资格**，另一个得到稳定 `409` 且不改写活动版本。
 
 ## 架构
 
 ```
 backend/          FastAPI 服务
-  models.py       槽位/设备/恢复报告领域模型（EMPTY→CANDIDATE→VERIFIED→CONFIRMED / REJECTED / SUPERSEDED）
+  models.py       槽位/设备/恢复报告领域模型（EMPTY→CANDIDATE→VERIFIED→CONFIRMED / REJECTED / SUPERSEDED）；
+                  每个槽位携带所属设备标识 device_id，异设备镜像即使摘要自洽也不可引导
   versioning.py   点分数字版本比较（候选必须严格更高）
-  store.py        SQLite(WAL) 持久化：槽位清单、候选阶段、确认代次、资格令牌、诊断证据、镜像 BLOB
+  store.py        SQLite(WAL) 持久化：槽位清单、候选阶段、确认代次、资格令牌、诊断证据、镜像 BLOB；
+                  blobs 以 (device_id, slot) 为主键，A/B 同名槽位绝不共享字节；含旧库迁移
   service.py      升级编排：代次资格、摘要校验、原子确认切换、断电恢复裁决
-  api.py          HTTP API + 托管 web/dist 静态页面
+  api.py          HTTP API + 托管 web/dist 静态页面；合成镜像按 (设备, 版本) 生成，
+                  两台设备同版本初始化也得到不同字节与摘要
 web/              Vite 原生 JS 前端（中文界面，全部操作经真实 API）
-tests/            pytest（14 个用例：三种断电、损坏候选、并发裁决、防回退、重开一致）
+tests/            pytest（23 个用例：三种断电、损坏候选、并发裁决、防回退、重开一致、
+                  双设备隔离、异设备/污染镜像安全拒绝、旧库迁移）
 scripts/
   verify.sh       一次性验收：pytest → 构建页面 → 真实 uvicorn → HTTP 冒烟
-  smoke_http.py   断电恢复与并发裁决的 HTTP 冒烟（63 条断言）
+  smoke_http.py   断电恢复、并发裁决、双设备隔离与污染收敛的 HTTP 冒烟（123 条断言）
 Dockerfile        运行镜像（多阶段：Node 构建页面 + Python 运行）
 Dockerfile.verify 验收镜像（含 Node/Python，compose 中的 verify 服务）
 docker-compose.yml
@@ -33,9 +39,12 @@ docker-compose.yml
 | 候选写入 `candidate_write` | 只落盘部分字节，槽位 `CANDIDATE`，`written < size` | 诊断 `incomplete_write`，继续引导旧槽 |
 | 摘要校验 `digest_check` | 字节写完但校验结论未提交，`actual_digest` 为空 | 诊断 `unverified_candidate`，不升级 |
 | 确认切换 `confirm_switch` | 候选仍 `VERIFIED`（未确认），代次不变 | 诊断 `unconfirmed_candidate`，引导旧版本；恢复后仍可再确认 |
-| 镜像损坏 | 清单摘要 ≠ 实测摘要，槽位 `REJECTED`，证据保留 | 诊断 `digest_mismatch`，永不引导 |
+| 镜像损坏 / 被异设备字节覆盖 | 清单摘要 ≠ 实测摘要（或镜像缺失/长度不符），即使残留 `CONFIRMED` | 恢复复检标记 `REJECTED`，诊断 `digest_mismatch`，证据保留，永不引导 |
+| 清单属于另一台设备 | 槽位 `device_id` 与本设备不符 | 诊断 `foreign_device_image`，拒绝跨设备引导 |
 
-所有变更在 SQLite `BEGIN IMMEDIATE` 事务内完成，`COMMIT` 是唯一原子切换点；并发提交由数据库写锁串行化后再做代次资格裁决，因此冲突结果稳定。
+恢复裁决对每个 `CONFIRMED` 槽位重新读取其 `(device_id, slot)` 镜像字节并复算 SHA-256，**同时**满足「属于该设备」「镜像完整（长度/清单）」「实测摘要 = 清单摘要」「已确认」才可引导；任何一条不满足都降级为 `REJECTED` 并追加证据。所有变更在 SQLite `BEGIN IMMEDIATE` 事务内完成，`COMMIT` 是唯一原子切换点；并发提交由数据库写锁串行化后再做代次资格裁决，因此冲突结果稳定。
+
+> 旧版本数据库的 `blobs` 表曾以 `slot` 单独为主键（异设备同名槽位共享字节）。打开旧库时自动迁移：单设备库保留其无歧义字节并回填槽位归属；多设备库丢弃无法判定归属的共享字节，使恢复失败于安全侧（拒绝引导）而非猜测性引导。
 
 ## 快速开始（Docker Compose）
 
@@ -58,7 +67,7 @@ docker compose run --rm verify
 
 1. `pytest` 代码测试；
 2. `npm run build` 构建页面；
-3. 启动**真实 uvicorn**，对三种断电恢复、损坏候选、并发 409 裁决、切换后重开一致性进行 HTTP 冒烟；
+3. 启动**真实 uvicorn**，对三种断电恢复、损坏候选、并发 409 裁决、切换后重开一致性，以及**双设备同版本不同镜像初始化、一台升级后另一台断电恢复的隔离性、摘要↔活动槽位一致、已污染记录的安全拒绝收敛**进行 HTTP 冒烟；
 4. 执行完毕**自行退出**，全部通过退出码为 0，任一失败非 0。
 
 ## 本地开发（无 Docker）

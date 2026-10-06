@@ -117,6 +117,7 @@ function renderSlot(slot) {
     h('h4', {}, `槽位 ${slot.name}`,
       active ? h('span', { class: 'active-tag' }, '● 活动槽位（正在引导）') : statusBadge(slot)),
     h('div', { class: 'kv' },
+      h('div', {}, h('b', {}, '所属设备'), slot.device_id ?? '—'),
       h('div', {}, h('b', {}, '状态'), slot.status),
       h('div', {}, h('b', {}, '版本'), slot.version ?? '—'),
       h('div', {}, h('b', {}, '清单摘要'), h('span', { class: 'mono' }, slot.digest ?? '—')),

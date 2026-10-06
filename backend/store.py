@@ -29,9 +29,10 @@ CREATE TABLE IF NOT EXISTS devices (
     powered_on  INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS blobs (
+    device_id TEXT NOT NULL,
     slot      TEXT NOT NULL,
     content   BLOB NOT NULL,
-    PRIMARY KEY (slot)
+    PRIMARY KEY (device_id, slot)
 );
 """
 
@@ -50,6 +51,60 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate_legacy()
+
+    def _migrate_legacy(self) -> None:
+        """Upgrade databases written by older versions.
+
+        Two legacy defects are repaired defensively:
+
+        * The ``blobs`` table was keyed by ``slot`` alone, so device 乙's
+          write to slot A/B silently overwrote device 甲's image bytes. Rows
+          are kept only when the database held exactly one device (the
+          ``(device_id, slot)`` mapping is then unambiguous); with multiple
+          devices the shared bytes are discarded rather than guessed.
+        * Persisted slot manifests predating the ownership field have no
+          ``device_id``. Such a slot was always created for the device that
+          owns its row, so ownership is back-filled from that device; the
+          recovery digest re-check still fails closed if the bytes on flash
+          are another device's.
+        """
+        rows = self._conn.execute(
+            "SELECT device_id, data FROM devices"
+        ).fetchall()
+
+        changed = False
+        for row in rows:
+            payload = json.loads(row["data"])
+            slot_changed = False
+            for slot_data in payload.get("slots", {}).values():
+                if not slot_data.get("device_id"):
+                    slot_data["device_id"] = row["device_id"]
+                    slot_changed = True
+            if slot_changed:
+                self._conn.execute(
+                    "UPDATE devices SET data=? WHERE device_id=?",
+                    (json.dumps(payload, separators=(",", ":")), row["device_id"]),
+                )
+                changed = True
+
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(blobs)").fetchall()
+        }
+        if cols and not {"device_id", "slot", "content"} <= cols:
+            self._conn.execute("ALTER TABLE blobs RENAME TO blobs_legacy")
+            self._conn.executescript(SCHEMA)
+            device_ids = [r["device_id"] for r in rows]
+            if len(device_ids) == 1:
+                self._conn.execute(
+                    """
+                    INSERT INTO blobs (device_id, slot, content)
+                    SELECT ?, slot, content FROM blobs_legacy
+                    """,
+                    (device_ids[0],),
+                )
+            self._conn.execute("DROP TABLE blobs_legacy")
 
     def close(self) -> None:
         with self._lock:
@@ -137,15 +192,16 @@ class Store:
     ) -> None:
         conn.execute(
             """
-            INSERT INTO blobs (slot, content) VALUES (?, ?)
-            ON CONFLICT(slot) DO UPDATE SET content=excluded.content
+            INSERT INTO blobs (device_id, slot, content) VALUES (?, ?, ?)
+            ON CONFLICT(device_id, slot) DO UPDATE SET content=excluded.content
             """,
-            (slot, content),
+            (device_id, slot, content),
         )
 
-    def read_blob(self, conn: sqlite3.Connection, slot: str) -> bytes | None:
+    def read_blob(self, conn: sqlite3.Connection, device_id: str, slot: str) -> bytes | None:
         row = conn.execute(
-            "SELECT content FROM blobs WHERE slot=?", (slot,)
+            "SELECT content FROM blobs WHERE device_id=? AND slot=?",
+            (device_id, slot),
         ).fetchone()
         return row["content"] if row else None
 
@@ -154,16 +210,16 @@ class Store:
     ) -> int:
         """Persist a streaming write; returns the new total byte count."""
         row = conn.execute(
-            "SELECT content FROM blobs WHERE slot=?",
-            (slot,),
+            "SELECT content FROM blobs WHERE device_id=? AND slot=?",
+            (device_id, slot),
         ).fetchone()
         content = (row["content"] if row else b"") + chunk
         conn.execute(
             """
-            INSERT INTO blobs (slot, content) VALUES (?, ?)
-            ON CONFLICT(slot) DO UPDATE SET content=excluded.content
+            INSERT INTO blobs (device_id, slot, content) VALUES (?, ?, ?)
+            ON CONFLICT(device_id, slot) DO UPDATE SET content=excluded.content
             """,
-            (slot, content),
+            (device_id, slot, content),
         )
         return len(content)
 

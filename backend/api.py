@@ -61,16 +61,25 @@ class ConfirmBody(BaseModel):
     fault_point: Optional[str] = None
 
 
-def _decode_content(content_b64: Optional[str], version: str, corrupt: bool) -> bytes:
+def _decode_content(
+    content_b64: Optional[str], version: str, corrupt: bool, device_id: str = ""
+) -> bytes:
     if content_b64:
         try:
             data = base64.b64decode(content_b64, validate=True)
         except binascii.Error as exc:
             raise ApiError(400, "bad_content", "content_b64 不是合法的 Base64") from exc
     else:
-        # Deterministic synthetic payload image: 256 bytes, version tagged.
-        tag = f"payload-image::{version}::".encode()
-        data = (tag + bytes((i * 7 + len(version)) & 0xFF for i in range(256 - len(tag))))[:256]
+        # Deterministic synthetic payload image: 256 bytes, tagged with BOTH
+        # the device identity and the version. Two devices at the same version
+        # therefore receive different bytes and different digests -- an image
+        # always belongs to the one device it was provisioned/upgraded for.
+        tag = f"payload-image::{device_id}::{version}::".encode()
+        seed = sum(device_id.encode("utf-8")) & 0xFF
+        body = bytes(
+            (i * 7 + len(version) + seed) & 0xFF for i in range(256 - len(tag))
+        )
+        data = (tag + body)[:256]
     return data
 
 
@@ -100,7 +109,9 @@ def list_devices() -> dict:
 
 @app.post("/api/devices", status_code=201)
 def create_device(body: CreateDeviceBody) -> dict:
-    content = _decode_content(body.content_b64, body.version, corrupt=False)
+    content = _decode_content(
+        body.content_b64, body.version, corrupt=False, device_id=body.device_id
+    )
     service.create_device(body.device_id, body.version, content, body.digest)
     return {"outcome": "created", "device": _device_view(body.device_id)}
 
@@ -112,7 +123,9 @@ def get_device(device_id: str) -> dict:
 
 @app.post("/api/devices/{device_id}/candidate")
 def submit_candidate(device_id: str, body: CandidateBody) -> dict:
-    content = _decode_content(body.content_b64, body.version, body.corrupt)
+    content = _decode_content(
+        body.content_b64, body.version, body.corrupt, device_id=device_id
+    )
     # For a corruption demo the manifest keeps the *clean* digest while the
     # bytes on flash are damaged, so verification is forced to fail.
     claimed = body.digest.lower() if body.digest else None

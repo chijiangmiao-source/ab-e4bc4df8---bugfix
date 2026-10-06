@@ -48,6 +48,7 @@ for i in $(seq 1 50); do
 done
 
 echo "==> [4/4] HTTP smoke: power-loss recovery + concurrent adjudication"
-"$PY" scripts/smoke_http.py "http://127.0.0.1:$SMOKE_PORT"
+SMOKE_DB="$TMPDIR_RUN/upgrade.db" "$PY" scripts/smoke_http.py "http://127.0.0.1:$SMOKE_PORT"
 
 echo "==> VERIFY PASSED"
+exit 0

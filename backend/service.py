@@ -74,6 +74,7 @@ class UpgradeService:
         digest = digest or sha256_hex(content)
         slot_a = Slot(
             name="A",
+            device_id=device_id,
             status=SlotStatus.CONFIRMED,
             version=version,
             digest=digest,
@@ -82,7 +83,7 @@ class UpgradeService:
             written=len(content),
             confirmed_generation=1,
         )
-        slot_b = Slot(name="B")
+        slot_b = Slot(name="B", device_id=device_id)
         dev = Device(
             device_id=device_id,
             slots={"A": slot_a, "B": slot_b},
@@ -180,6 +181,7 @@ class UpgradeService:
 
             target_name = dev.inactive_slot_name()
             target = dev.slots[target_name]
+            target.device_id = device_id  # image written here belongs to this device
             target.status = SlotStatus.CANDIDATE
             target.version = req.version
             target.digest = claimed
@@ -239,7 +241,7 @@ class UpgradeService:
             )
 
         with self.store.transaction() as conn:
-            content = self.store.read_blob(conn, target_name)
+            content = self.store.read_blob(conn, device_id, target_name)
             actual = sha256_hex(content or b"")
             dev = self.store.load(device_id)
             t = dev.slots[target_name]
@@ -287,6 +289,7 @@ class UpgradeService:
     def confirm_switch(self, device_id: str, req: ConfirmRequest) -> dict:
         if req.fault_point not in (None, "confirm_switch"):
             raise ApiError(400, "bad_fault_point", "未知故障点")
+        rejection: Optional[ApiError] = None
         with self.store.transaction() as conn:
             raw = self.store.load_raw(device_id)
             if raw is None:
@@ -305,7 +308,7 @@ class UpgradeService:
                     "不存在已验证待确认的候选",
                 )
             # Re-measure immediately before commit: never confirm on trust.
-            content = self.store.read_blob(conn, target_name)
+            content = self.store.read_blob(conn, device_id, target_name)
             actual = sha256_hex(content) if content is not None else None
             if actual != target.digest or target.digest is None:
                 target.status = SlotStatus.REJECTED
@@ -316,50 +319,57 @@ class UpgradeService:
                     f"确认前复检失败：清单 {target.digest}，实测 {actual}；禁止切换",
                 )
                 self.store.save(conn, dev)
-                raise ApiError(
+                # Commit the REJECTED verdict + evidence FIRST: raising inside
+                # this block would roll them back. The error is delivered to
+                # the caller only after the transaction exits and commits.
+                rejection = ApiError(
                     422,
                     "digest_mismatch",
                     "确认前摘要复检失败，已阻止切换并保留损坏证据",
                     extra={"actual_digest": actual},
                 )
-            if not is_higher(target.version or "0", dev.slots[dev.active_slot].version or "0"):
-                raise ApiError(422, "version_not_higher", "候选版本不再高于活动版本")
+            else:
+                if not is_higher(target.version or "0", dev.slots[dev.active_slot].version or "0"):
+                    raise ApiError(422, "version_not_higher", "候选版本不再高于活动版本")
 
-            if req.fault_point == "confirm_switch":
-                # Power loss before the atomic switch record commits: old slot
-                # stays the unique confirmed slot; candidate remains unconfirmed.
-                self.store.set_powered(conn, device_id, False)
+                if req.fault_point == "confirm_switch":
+                    # Power loss before the atomic switch record commits: old slot
+                    # stays the unique confirmed slot; candidate remains unconfirmed.
+                    self.store.set_powered(conn, device_id, False)
+                    dev.add_evidence(
+                        target_name,
+                        "power_cut_confirm",
+                        f"确认切换提交前断电：候选 {target.version} 尚未确认，"
+                        f"代次仍为 {dev.generation}，继续引导旧版本",
+                    )
+                    self.store.save(conn, dev)
+                    return {
+                        "outcome": "power_cut",
+                        "fault_point": "confirm_switch",
+                        "target_slot": target_name,
+                        "device": self.store.load(device_id).to_dict(),
+                    }
+
+                old_name = dev.active_slot
+                old = dev.slots[old_name]
+                old.status = SlotStatus.SUPERSEDED
+                target.status = SlotStatus.CONFIRMED
+                dev.generation += 1
+                target.confirmed_generation = dev.generation
+                dev.active_slot = target_name
+                dev.qualified_generation = None
+                dev.qualified_request = None
+                dev.qualified_slot = None
                 dev.add_evidence(
                     target_name,
-                    "power_cut_confirm",
-                    f"确认切换提交前断电：候选 {target.version} 尚未确认，"
-                    f"代次仍为 {dev.generation}，继续引导旧版本",
+                    "switch_committed",
+                    f"代次 {dev.generation} 已提交：活动槽位 {old_name} → {target_name}，"
+                    f"版本 {target.version} 生效；旧槽位标记 SUPERSEDED，禁止回退",
                 )
                 self.store.save(conn, dev)
-                return {
-                    "outcome": "power_cut",
-                    "fault_point": "confirm_switch",
-                    "target_slot": target_name,
-                    "device": self.store.load(device_id).to_dict(),
-                }
 
-            old_name = dev.active_slot
-            old = dev.slots[old_name]
-            old.status = SlotStatus.SUPERSEDED
-            target.status = SlotStatus.CONFIRMED
-            dev.generation += 1
-            target.confirmed_generation = dev.generation
-            dev.active_slot = target_name
-            dev.qualified_generation = None
-            dev.qualified_request = None
-            dev.qualified_slot = None
-            dev.add_evidence(
-                target_name,
-                "switch_committed",
-                f"代次 {dev.generation} 已提交：活动槽位 {old_name} → {target_name}，"
-                f"版本 {target.version} 生效；旧槽位标记 SUPERSEDED，禁止回退",
-            )
-            self.store.save(conn, dev)
+        if rejection is not None:
+            raise rejection
 
         return {
             "outcome": "switched",
@@ -384,7 +394,7 @@ class UpgradeService:
                 raise ApiError(404, "not_found", f"设备 {device_id} 不存在")
             was_off = not raw.pop("_powered_on")
             dev = Device.from_dict(raw)
-            self._refresh_confirmed_measurements(conn, dev)
+            self._verify_manifest_integrity(conn, dev)
             report = self._adjudicate(dev)
             report.powered_from_off = was_off
             dev.last_recovery = report
@@ -410,22 +420,77 @@ class UpgradeService:
         }
 
     # ------------------------------------------------------------------ #
-    def _refresh_confirmed_measurements(self, conn, dev: Device) -> None:
-        for slot in dev.slots.values():
+    def _verify_manifest_integrity(self, conn, dev: Device) -> None:
+        """Re-measure every CONFIRMED slot *before* adjudication.
+
+        Boot eligibility requires ALL of:
+
+        1. the manifest belongs to THIS physical device (two devices may both
+           label their slots "A"/"B" -- that never makes an image portable);
+        2. the image manifest is complete;
+        3. the digest re-measured from the bytes on flash equals the manifest;
+        4. the slot is CONFIRMED.
+
+        A surviving CONFIRMED flag is never trusted on its own: any failure
+        demotes the slot to REJECTED with append-only evidence, and recovery
+        refuses to boot the foreign / corrupt / missing image.
+        """
+        for name in sorted(dev.slots):
+            slot = dev.slots[name]
             if slot.status is not SlotStatus.CONFIRMED:
                 continue
-            content = self.store.read_blob(conn, slot.name)
-            measured = sha256_hex(content) if content is not None else None
-            if measured == slot.actual_digest:
+
+            if not slot.belongs_to(dev.device_id):
+                slot.status = SlotStatus.REJECTED
+                dev.add_evidence(
+                    name,
+                    "foreign_device_image",
+                    f"槽位清单元数据属于设备 {slot.device_id or '未知'}，"
+                    f"并非本设备 {dev.device_id}；禁止引导异设备镜像，"
+                    "已标记 REJECTED 并保留证据",
+                )
                 continue
+
+            content = self.store.read_blob(conn, dev.device_id, name)
+            measured = sha256_hex(content) if content is not None else None
             prior = slot.actual_digest
-            slot.actual_digest = measured
-            dev.add_evidence(
-                slot.name,
-                "recovery_measurement_changed",
-                f"恢复时重新测得摘要 {measured or '缺失'}；"
-                f"上次持久化实测值为 {prior or '缺失'}",
-            )
+            if measured != prior:
+                slot.actual_digest = measured
+                dev.add_evidence(
+                    name,
+                    "recovery_measurement_changed",
+                    f"恢复时重新测得摘要 {measured or '缺失'}；"
+                    f"上次持久化实测值为 {prior or '缺失'}；"
+                    f"清单摘要 {slot.digest or '缺失'}",
+                )
+
+            if content is None:
+                slot.status = SlotStatus.REJECTED
+                dev.add_evidence(
+                    name,
+                    "image_missing",
+                    f"槽位 {name} 状态虽为 CONFIRMED，但持久化镜像缺失；"
+                    "禁止引导，已标记 REJECTED",
+                )
+                continue
+            if slot.size is not None and len(content) != slot.size:
+                slot.status = SlotStatus.REJECTED
+                dev.add_evidence(
+                    name,
+                    "incomplete_image",
+                    f"持久化镜像长度 {len(content)} 与清单 {slot.size} 不一致；"
+                    "镜像不完整，禁止引导，已标记 REJECTED",
+                )
+                continue
+            if not slot.digest or measured != slot.digest:
+                slot.status = SlotStatus.REJECTED
+                dev.add_evidence(
+                    name,
+                    "digest_mismatch",
+                    f"恢复复检摘要不符：清单 {slot.digest or '缺失'}，"
+                    f"实测 {measured or '缺失'}；即使状态残留为 CONFIRMED "
+                    "也禁止引导，已标记 REJECTED 并保留证据",
+                )
 
     def _adjudicate(self, dev: Device) -> RecoveryReport:
         """Pick the unique bootable slot; explain every other slot's fate."""
@@ -437,14 +502,15 @@ class UpgradeService:
         eligible: list[str] = []
         for name in sorted(dev.slots):
             slot = dev.slots[name]
-            ok, reason, detail = self._slot_verdict(slot)
+            ok, reason, detail = self._slot_verdict(dev, slot)
             if ok:
                 eligible.append(name)
             else:
                 report.diagnoses.append(Diagnosis(name, reason, detail))
 
         report.rationale.append(
-            "恢复规则：仅从【清单完整 且 状态为 CONFIRMED】的槽位中选定唯一活动槽位"
+            "恢复规则：仅从【属于本设备 且 镜像完整 且 实测摘要与清单一致 "
+            "且 状态为 CONFIRMED】的槽位中选定唯一活动槽位"
         )
         report.rationale.append(f"当前确认代次：{dev.generation}")
 
@@ -470,10 +536,11 @@ class UpgradeService:
                 )
         elif len(eligible) == 0:
             report.critical = (
-                "不存在任何清单完整且已确认的槽位，设备无法引导；"
-                "所有未确认/损坏候选均保留为诊断证据且未被选择"
+                "不存在任何【属于本设备、镜像完整、实测摘要与清单一致且已确认】"
+                "的槽位，设备拒绝引导并保持维修状态；未确认 / 损坏 / 异设备镜像"
+                "均保留为可复核诊断证据，且未被选择，也不回退到已被取代的版本"
             )
-            report.rationale.append("裁决：零合格槽位，保持关机/维修状态")
+            report.rationale.append("裁决：零合格槽位，安全关机/等待维修")
         else:
             report.critical = (
                 f"合格槽位不唯一（{eligible}），拒绝猜测性引导，等待人工裁决"
@@ -483,9 +550,30 @@ class UpgradeService:
         return report
 
     @staticmethod
-    def _slot_verdict(slot: Slot) -> tuple[bool, str, str]:
+    def _slot_verdict(dev: Device, slot: Slot) -> tuple[bool, str, str]:
+        # Ownership is independent of lifecycle stage: a slot of another device
+        # must never boot here, no matter what status its manifest retained.
+        if not slot.belongs_to(dev.device_id):
+            return (
+                False,
+                "foreign_device_image",
+                f"槽位清单元数据属于设备 {slot.device_id or '未知'}，"
+                f"并非本设备 {dev.device_id}；即使镜像摘要自洽也禁止跨设备引导",
+            )
         if slot.status is SlotStatus.CONFIRMED and slot.manifest_complete():
-            return True, "eligible", "清单完整且已确认，具备引导资格"
+            # Digest integrity was re-measured before adjudication; a CONFIRMED
+            # slot reaching here matches the manifest byte-for-byte.
+            if slot.actual_digest and slot.actual_digest == slot.digest:
+                return True, "eligible", (
+                    "镜像属于本设备、清单完整、实测摘要与清单一致且已确认，"
+                    "具备引导资格"
+                )
+            return (
+                False,
+                "digest_mismatch",
+                f"CONFIRMED 槽位恢复复检不通过：清单 {slot.digest}，"
+                f"实测 {slot.actual_digest}；残留的 CONFIRMED 状态不予采信，禁止引导",
+            )
         if slot.status is SlotStatus.EMPTY:
             return False, "empty_slot", "空槽位，无镜像清单"
         if slot.status is SlotStatus.CANDIDATE:
@@ -513,8 +601,8 @@ class UpgradeService:
             return (
                 False,
                 "digest_mismatch",
-                f"候选 {slot.version or ''} 摘要不符（清单 {slot.digest}，"
-                f"实测 {slot.actual_digest}），损坏证据已保留，禁止引导",
+                f"候选 {slot.version or ''} 摘要不符或镜像异常（清单 {slot.digest}，"
+                f"实测 {slot.actual_digest}），损坏/异设备证据已保留，禁止引导",
             )
         if slot.status is SlotStatus.SUPERSEDED:
             return (

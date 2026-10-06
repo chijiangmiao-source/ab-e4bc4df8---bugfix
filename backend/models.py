@@ -48,6 +48,10 @@ FAULT_POINTS = (
 @dataclass
 class Slot:
     name: str
+    # Identity of the physical device whose image this slot may hold. Two
+    # devices both labelling their slots "A"/"B" still own distinct images:
+    # a manifest whose owner id is not this device can never boot here.
+    device_id: Optional[str] = None
     status: SlotStatus = SlotStatus.EMPTY
     version: Optional[str] = None
     digest: Optional[str] = None          # digest claimed by the manifest
@@ -56,12 +60,18 @@ class Slot:
     written: int = 0
     confirmed_generation: Optional[int] = None
 
+    def belongs_to(self, device_id: str) -> bool:
+        # Strict: a manifest with no recorded owner cannot prove it belongs to
+        # this device, so it must not boot (fail closed, never fail open).
+        return self.device_id == device_id
+
     def manifest_complete(self) -> bool:
         """True iff the write finished and a manifest digest is present.
 
-        Note: completeness alone is not enough to boot -- CONFIRMED status is
-        also required. REJECTED/SUPERSEDED slots may carry complete manifests
-        but must never be selected.
+        Note: completeness alone is not enough to boot -- CONFIRMED status,
+        device ownership and a digest re-measurement are also required.
+        REJECTED/SUPERSEDED slots may carry complete manifests but must never
+        be selected.
         """
         if self.status in (SlotStatus.EMPTY, SlotStatus.CANDIDATE):
             return False
@@ -74,6 +84,7 @@ class Slot:
     def to_dict(self) -> dict:
         return {
             "name": self.name,
+            "device_id": self.device_id,
             "status": self.status.value,
             "version": self.version,
             "digest": self.digest,
@@ -82,13 +93,24 @@ class Slot:
             "written": self.written,
             "confirmed_generation": self.confirmed_generation,
             "manifest_complete": self.manifest_complete(),
-            "bootable": self.status.bootable and self.manifest_complete(),
+            # Reflects the structural preconditions the recovery adjudicator
+            # enforces for a CONFIRMED slot: ownership, completeness and an
+            # on-record digest agreement. Recovery still re-measures the bytes
+            # itself before trusting any of this.
+            "bootable": (
+                self.status.bootable
+                and self.manifest_complete()
+                and self.device_id is not None
+                and bool(self.digest)
+                and self.digest == self.actual_digest
+            ),
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Slot":
         return cls(
             name=data["name"],
+            device_id=data.get("device_id"),
             status=SlotStatus(data["status"]),
             version=data.get("version"),
             digest=data.get("digest"),
